@@ -523,6 +523,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
     RICH_MESSAGE_MAX_CHARS = 32768  # Bot API 10.1 rich cap; above it use legacy chunking
     _SPLIT_THRESHOLD = 4000  # chunk near this length ⇒ a client-side split continuation is almost certain
     MEDIA_GROUP_WAIT_SECONDS = 0.8
+    ALBUM_ADMIT_TTL_SECONDS = 60.0  # how long an album that passed the group gate keeps admitting its other items
     HELD_INBOUND_MAX = 64  # inbound events held across a disconnect window; oldest dropped first
     _GENERAL_TOPIC_THREAD_ID = "1"
     # send() can race a disconnect blip; failing "Not connected" (retryable=False) parks the answer in the
@@ -625,6 +626,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         self._pending_photo_batch_tasks: Dict[str, asyncio.Task] = {}
         self._media_group_events: Dict[str, MessageEvent] = {}
         self._media_group_tasks: Dict[str, asyncio.Task] = {}
+        # "<chat_id>:<media_group_id>" -> monotonic time the album's first gated item passed the group trigger rules.
+        self._admitted_media_groups: Dict[str, float] = {}
         # Aggregate client-side splits of long messages into one MessageEvent; bounds are conservative
         # for Telegram's ~1 edit/s flood envelope.
         self._text_batch_delay_seconds = self._env_float_clamped(
@@ -6778,6 +6781,17 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             await self._surface_media_cache_failure(msg, event, "attachment", e, display_name=getattr(doc, "file_name", None) or None)
         return False
 
+    def _album_key(self, msg: Message) -> Optional[str]:
+        media_group_id = getattr(msg, "media_group_id", None)
+        return f"{self._chat_id_str(msg)}:{media_group_id}" if media_group_id else None
+
+    def _album_admitted(self, album_key: str) -> bool:
+        now = time.monotonic()
+        for key, admitted_at in list(self._admitted_media_groups.items()):
+            if now - admitted_at > self.ALBUM_ADMIT_TTL_SECONDS:
+                del self._admitted_media_groups[key]
+        return album_key in self._admitted_media_groups
+
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
         msg = update.message
@@ -6786,7 +6800,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         if not self._is_user_authorized_from_message(msg):
             self._log_blocked_user(msg, level=logging.INFO, what="media from unauthorized user")
             return
-        if not self._should_process_message(msg):
+        # Telegram puts an album caption on one item only, so the other items carry no @mention: once one item of an
+        # album passes the group gate, admit the rest of the same album instead of dropping them before the merge.
+        album_key = self._album_key(msg)
+        if self._should_process_message(msg):
+            if album_key:
+                self._admitted_media_groups[album_key] = time.monotonic()
+        elif not (album_key and self._album_admitted(album_key)):
             if self._should_observe_unmentioned_group_message(msg):
                 _event = self._build_message_event(msg, self._media_message_type(msg), update_id=update.update_id)
                 if msg.caption:

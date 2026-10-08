@@ -302,6 +302,54 @@ class TestMediaGroups:
         assert event.media_urls == ["/tmp/burst-one.jpg", "/tmp/burst-two.jpg"]
         assert len(event.media_types) == 2
 
+    @staticmethod
+    def _group_album(captioned_gid, plain_gid, caption="@bot how many?"):
+        msg1 = _make_message(caption=caption, photo=[_make_photo(_make_file_obj(b"one"))], media_group_id=captioned_gid)
+        msg2 = _make_message(photo=[_make_photo(_make_file_obj(b"two"))], media_group_id=plain_gid)
+        for m in (msg1, msg2):
+            m.chat.type = "supergroup"
+            m.chat.id = -100
+        return msg1, msg2
+
+    @staticmethod
+    def _mention_gate(adapter):
+        # Group gate stand-in: only the item whose caption carries the @mention passes.
+        adapter._should_process_message = lambda m, **_kw: bool(m.caption and "@bot" in m.caption)
+        adapter._should_observe_unmentioned_group_message = lambda m: False
+
+    async def _deliver(self, adapter, *msgs):
+        with patch(
+            "plugins.platforms.telegram.adapter.cache_image_from_bytes_async",
+            new=AsyncMock(side_effect=["/tmp/album-one.jpg", "/tmp/album-two.jpg"]),
+        ):
+            for m in msgs:
+                await adapter._handle_media_message(_make_update(m), MagicMock())
+            await asyncio.sleep(adapter.MEDIA_GROUP_WAIT_SECONDS + 0.05)
+
+    @pytest.mark.asyncio
+    async def test_group_album_items_after_mentioned_item_are_admitted(self, adapter):
+        self._mention_gate(adapter)
+        await self._deliver(adapter, *self._group_album("album-1", "album-1"))
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.media_urls == ["/tmp/album-one.jpg", "/tmp/album-two.jpg"]
+
+    @pytest.mark.asyncio
+    async def test_group_album_without_mention_is_dropped(self, adapter):
+        self._mention_gate(adapter)
+        await self._deliver(adapter, *self._group_album("album-1", "album-1", caption="no tag"))
+
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unmentioned_item_of_another_album_is_not_admitted(self, adapter):
+        self._mention_gate(adapter)
+        await self._deliver(adapter, *self._group_album("album-1", "album-2"))
+
+        adapter.handle_message.assert_awaited_once()
+        assert adapter.handle_message.await_args.args[0].media_urls == ["/tmp/album-one.jpg"]
+
 
 # ---------------------------------------------------------------------------
 # TestSendVoice — outbound audio delivery
