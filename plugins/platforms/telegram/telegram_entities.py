@@ -6,7 +6,13 @@ URL; the model only ever sees the anchor unless the URL is inlined (#31071).
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
+
+# Marker line prefixed to the text of a forwarded message. A forward carries someone else's words
+# (or the user's own, re-shared), so the model and the stored transcript must not read it as
+# something the user just typed. The origin's name is deliberately left out.
+FORWARD_MARKER = "[Forwarded message]"
 
 
 def _utf16_length(text: str) -> int:
@@ -66,3 +72,30 @@ def expand_link_entities(message: Any) -> str:
             continue
         expanded = f"{expanded[:end]}{inline}{expanded[end:]}"
     return expanded
+
+
+def is_forwarded(message: Any) -> bool:
+    """True when Telegram delivered ``message`` as a forward (or a channel auto-forward).
+
+    Every forward carries the original send date: ``forward_origin.date`` on Bot API 7+ and the
+    legacy ``forward_date`` before it, so a real ``datetime`` there is the signal. Checking the
+    type (not mere truthiness) keeps attribute-auto-creating test doubles from reading as forwards.
+    """
+    if getattr(message, "is_automatic_forward", None) is True:
+        return True
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None and isinstance(getattr(origin, "date", None), datetime):
+        return True
+    return isinstance(getattr(message, "forward_date", None), datetime)
+
+
+def inbound_text(message: Any) -> str:
+    """Event text for an inbound message: ``expand_link_entities`` plus the forward marker line.
+
+    A forward with no text or caption (bare photo, voice note) still gets the marker, so later
+    enrichment (vision description, voice transcript) lands in a row that says it was forwarded.
+    """
+    text = expand_link_entities(message)
+    if not is_forwarded(message):
+        return text
+    return f"{FORWARD_MARKER}\n\n{text}" if text else FORWARD_MARKER

@@ -178,7 +178,7 @@ _MEDIA_KIND_KEYS = {
     "video file": "platform.telegram.media.kind_video"}
 
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
-from plugins.platforms.telegram.telegram_entities import expand_link_entities
+from plugins.platforms.telegram.telegram_entities import inbound_text
 from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 from plugins.platforms.telegram.telegram_network import (
@@ -6790,14 +6790,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             if self._should_observe_unmentioned_group_message(msg):
                 _event = self._build_message_event(msg, self._media_message_type(msg), update_id=update.update_id)
                 if msg.caption:
-                    _event.text = self._clean_bot_trigger_text(expand_link_entities(msg))
+                    _event.text = self._clean_bot_trigger_text(inbound_text(msg))
                 await self._cache_observed_media(msg, _event)
                 self._observe_unmentioned_group_message(msg, _event.message_type, update_id=update.update_id, event=_event)
             return
         event = self._build_message_event(msg, self._media_message_type(msg), update_id=update.update_id)
         if msg.caption:
             from plugins.platforms.telegram.telegram_context import group_trigger_text
-            event.text = group_trigger_text(self, msg, expand_link_entities(msg))
+            event.text = group_trigger_text(self, msg, inbound_text(msg))
         # Stickers: _handle_sticker overwrites event.text with its vision description, so observe attribution must run after it.
         if msg.sticker:
             await self._handle_sticker(msg, event)
@@ -7100,7 +7100,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         _chat_id_str = str(chat.id)
         channel_prompt = resolve_channel_prompt(self.config.extra, thread_id_str or _chat_id_str, _chat_id_str if thread_id_str else None)
         return MessageEvent(
-            text=expand_link_entities(message), message_type=msg_type, source=source, raw_message=message,
+            text=inbound_text(message), message_type=msg_type, source=source, raw_message=message,
             message_id=str(message.message_id), platform_update_id=update_id,
             reply_to_message_id=reply_to_id, reply_to_text=reply_to_text, auto_skill=topic_skill,
             channel_prompt=group_identity_prompt(self, message, channel_prompt),
