@@ -103,3 +103,63 @@ def test_video_helpers_read_real_geometry(tmp_path):
     finally:
         with contextlib.suppress(OSError):
             os.remove(thumb)
+
+
+def _mp4(width: int, height: int, timescale: int, duration: int) -> bytes:
+    """Minimal ``ftyp`` + ``moov(mvhd v0, trak(tkhd v0))`` + ``mdat`` file."""
+    import struct
+
+    def box(kind: bytes, body: bytes) -> bytes:
+        return struct.pack(">I", 8 + len(body)) + kind + body
+
+    mvhd = b"\x00" * 4 + b"\x00" * 8 + struct.pack(">II", timescale, duration) + b"\x00" * 80
+    tkhd = b"\x00" * 76 + struct.pack(">II", width << 16, height << 16)
+    return (box(b"ftyp", b"isom" + b"\x00" * 4) + box(b"moov", box(b"mvhd", mvhd) + box(b"trak", box(b"tkhd", tkhd)))
+            + box(b"mdat", b"\x00" * 32))
+
+
+def test_moov_probe_reads_geometry_without_ffprobe(monkeypatch, tmp_path):
+    """Without ffprobe the geometry comes from ``mvhd`` and ``tkhd``; a non-MP4 gives ``{}``."""
+    monkeypatch.setattr(shutil, "which", lambda _n: None)
+    clip = tmp_path / "reel.loop.mp4"
+    clip.write_bytes(_mp4(1080, 1920, 24000, 360000))
+    assert telegram_mod._probe_video_geometry(str(clip)) == {"width": 1080, "height": 1920, "duration": 15}
+    junk = tmp_path / "junk.mp4"
+    junk.write_bytes(b"\x00\x00\x00\x02xx")
+    assert telegram_mod._probe_video_geometry(str(junk)) == {}
+
+
+@pytest.mark.asyncio
+async def test_loop_mp4_goes_to_send_animation_with_sidecar_thumbnail(monkeypatch, tmp_path):
+    """``*.loop.mp4`` autoplays and loops: ``send_animation`` with geometry and ``<stem>.thumb.jpg``."""
+    monkeypatch.setattr(shutil, "which", lambda _n: None)
+    clip = tmp_path / "reel-7.loop.mp4"
+    clip.write_bytes(_mp4(1080, 1920, 600, 9000))
+    thumb = tmp_path / "reel-7.thumb.jpg"
+    thumb.write_bytes(b"\xff\xd8\xff\xe0")
+    adapter = _make_adapter()
+    adapter._bot.send_animation = AsyncMock(return_value=MagicMock(message_id=9))
+
+    result = await adapter.send_video("123", str(clip), caption="Seoul")
+
+    assert result.success is True and result.message_id == "9"
+    adapter._bot.send_video.assert_not_awaited()
+    kwargs = adapter._bot.send_animation.await_args.kwargs
+    assert (kwargs["width"], kwargs["height"], kwargs["duration"]) == (1080, 1920, 15)
+    assert kwargs["thumbnail"] == str(thumb) and kwargs["caption"] == "Seoul"
+    assert thumb.exists(), "the producer's sidecar thumbnail is not the adapter's to delete"
+
+
+@pytest.mark.asyncio
+async def test_loop_mp4_falls_back_to_send_video_when_animation_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr(shutil, "which", lambda _n: None)
+    clip = tmp_path / "reel.loop.mp4"
+    clip.write_bytes(_mp4(1080, 1920, 24, 360))
+    adapter = _make_adapter()
+    adapter._bot.send_animation = AsyncMock(side_effect=RuntimeError("Bad Request: wrong file"))
+
+    result = await adapter.send_video("123", str(clip))
+
+    assert result.success is True and result.message_id == "7"
+    kwargs = adapter._bot.send_video.await_args.kwargs
+    assert (kwargs["width"], kwargs["height"], kwargs["duration"]) == (1080, 1920, 15)

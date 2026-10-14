@@ -267,7 +267,7 @@ def _probe_video_geometry(path: str) -> Dict[str, int]:
         import shutil
         import subprocess
         if not shutil.which("ffprobe"):
-            return {}
+            return _probe_mp4_moov(path)
         proc = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=width,height", "-show_entries", "format=duration",
@@ -287,6 +287,87 @@ def _probe_video_geometry(path: str) -> Dict[str, int]:
     except Exception:
         logger.debug("[Telegram] video geometry probe failed for %s", path, exc_info=True)
         return {}
+
+
+def _mp4_boxes(buf: bytes, start: int, end: int):
+    """Yield ``(type, body_start, body_end)`` for the ISO-BMFF boxes in ``buf[start:end]``."""
+    import struct
+    pos = start
+    while pos + 8 <= end:
+        size, kind = struct.unpack(">I4s", buf[pos:pos + 8])
+        head = 8
+        if size == 1:
+            if pos + 16 > end:
+                return
+            size = struct.unpack(">Q", buf[pos + 8:pos + 16])[0]
+            head = 16
+        elif size == 0:
+            size = end - pos
+        if size < head or pos + size > end:
+            return
+        yield kind.decode("latin-1"), pos + head, pos + size
+        pos += size
+
+
+def _probe_mp4_moov(path: str) -> Dict[str, int]:
+    """Stdlib fallback without ffprobe: width/height from the first video ``tkhd`` (16.16 fixed)
+    and whole-second duration from ``mvhd``. ``{}`` when the file has no readable ``moov``."""
+    import struct
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            moov = None
+            pos = 0
+            while pos + 8 <= size:
+                f.seek(pos)
+                head = f.read(16)
+                box, kind = struct.unpack(">I4s", head[:8])
+                hdr = 8
+                if box == 1:
+                    box, hdr = struct.unpack(">Q", head[8:16])[0], 16
+                elif box == 0:
+                    box = size - pos
+                if box < hdr:
+                    return {}
+                if kind == b"moov":
+                    if box > 16 * 1024 * 1024:
+                        return {}
+                    f.seek(pos + hdr)
+                    moov = f.read(box - hdr)
+                    break
+                pos += box
+        if not moov:
+            return {}
+        geometry: Dict[str, int] = {}
+        for kind, a, b in _mp4_boxes(moov, 0, len(moov)):
+            if kind == "mvhd" and b - a >= 32:
+                if moov[a] == 1:
+                    timescale, duration = struct.unpack(">IQ", moov[a + 20:a + 32])
+                else:
+                    timescale, duration = struct.unpack(">II", moov[a + 12:a + 20])
+                if timescale:
+                    seconds = int(round(duration / timescale))
+                    if seconds > 0:
+                        geometry["duration"] = seconds
+            elif kind == "trak" and "width" not in geometry:
+                for sub, c, d in _mp4_boxes(moov, a, b):
+                    if sub == "tkhd" and d - c >= 84:
+                        w, h = struct.unpack(">II", moov[d - 8:d])
+                        if w >> 16 and h >> 16:
+                            geometry["width"], geometry["height"] = w >> 16, h >> 16
+        return geometry if "width" in geometry else {}
+    except Exception:
+        logger.debug("[Telegram] moov probe failed for %s", path, exc_info=True)
+        return {}
+
+
+LOOP_VIDEO_SUFFIX = ".loop.mp4"
+
+
+def _loop_thumbnail_path(video_path: str) -> Optional[str]:
+    """Sidecar ``<stem>.thumb.jpg`` written next to a ``<stem>.loop.mp4`` by its producer."""
+    thumb = video_path[: -len(LOOP_VIDEO_SUFFIX)] + ".thumb.jpg"
+    return thumb if os.path.isfile(thumb) else None
 
 
 def _video_thumbnail_jpeg(path: str, duration: Optional[int]) -> Optional[str]:
@@ -5370,6 +5451,33 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                     TelegramAdapter, self,
                 ).send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)))
 
+    async def _send_loop_animation(
+        self, chat_id: str, video_path: str, caption: Optional[str], reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]]) -> SendResult:
+        """``*.loop.mp4`` → ``bot.send_animation`` so the clip autoplays and loops inline like a GIF.
+
+        ``sendVideo`` neither loops nor autoplays (tdlib/telegram-bot-api#301). Geometry comes from
+        the ``moov`` box when ffprobe is missing; the thumbnail is the producer's sidecar
+        ``<stem>.thumb.jpg``. Any failure returns ``success=False`` and the caller sends a video.
+        """
+        geometry = await asyncio.to_thread(_probe_video_geometry, video_path)
+        thumb_path = _loop_thumbnail_path(video_path)
+
+        def build_kwargs(f):
+            payload = {"animation": f, "caption": self._caption_1024(caption), **geometry}
+            if thumb_path:
+                payload["thumbnail"] = thumb_path
+            return payload
+
+        async def on_error(e: Exception) -> SendResult:
+            logger.warning(
+                "[%s] send_animation failed for loop video, sending as video: %s", self.name,
+                _redact_telegram_error_text(e))
+            return SendResult(success=False, error=str(e))
+
+        return await self._send_local_file(
+            "Animation", video_path, chat_id, reply_to, metadata, "animation", build_kwargs, on_error)
+
     async def send_video(
         self, chat_id: str, video_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
@@ -5380,6 +5488,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         ``320x320`` video with ``duration=0`` and no thumbnail, which clients then draw as a square
         tile whatever the true aspect ratio (portrait reels and 16:9 clips alike).
         """
+        if video_path.lower().endswith(LOOP_VIDEO_SUFFIX):
+            looped = await self._send_loop_animation(chat_id, video_path, caption, reply_to, metadata)
+            if looped.success:
+                return looped
         geometry = await asyncio.to_thread(_probe_video_geometry, video_path)
         thumb_path = (
             await asyncio.to_thread(_video_thumbnail_jpeg, video_path, geometry.get("duration"))
